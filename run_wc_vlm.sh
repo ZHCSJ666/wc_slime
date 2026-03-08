@@ -9,6 +9,10 @@ TRAIN_BACKEND=${SLIME_SCRIPT_TRAIN_BACKEND:-"megatron"}
 MODEL_NAME=${SLIME_SCRIPT_MODEL_NAME:-"Qwen3-VL-8B-Instruct"}
 MODEL_HF_REPO=${SLIME_SCRIPT_MODEL_HF_REPO:-"Qwen/Qwen3-VL-8B-Instruct"}
 
+# Hugging Face mirror for China
+HF_ENDPOINT_VALUE=${SLIME_SCRIPT_HF_ENDPOINT:-"https://hf-mirror.com"}
+export HF_ENDPOINT="${HF_ENDPOINT_VALUE}"
+
 # 项目根目录（仓库根目录）
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"
@@ -19,16 +23,19 @@ MEGATRON_ROOT=${SLIME_SCRIPT_MEGATRON_ROOT:-"/root/Megatron-LM"}
 # Hugging Face dataset
 HF_DATASET_NAME=${SLIME_SCRIPT_HF_DATASET_NAME:-"ZHCSJ/wc-en-open-slime-4k"}
 
-# 模型、数据、输出目录：都保留 team/longqin
+# 模型、数据、输出目录：保留 team/longqin
 MODEL_ROOT=${SLIME_SCRIPT_MODEL_ROOT:-"/data/oss_bucket_0/users/xintong/team/longqin/models"}
 DATASET_ROOT=${SLIME_SCRIPT_DATASET_ROOT:-"/data/oss_bucket_0/users/xintong/team/longqin/datasets"}
-OUTPUT_DIR=${SLIME_SCRIPT_OUTPUT_DIR:-"/data/oss_bucket_0/users/xintong/team/longqin/outputs/test_slime"}
+OUTPUT_DIR=${SLIME_SCRIPT_OUTPUT_DIR:-"/data/oss_bucket_0/users/xintong/team/longqin/outputs/wc_slime"}
 
 DATASET_LOCAL_NAME=${SLIME_SCRIPT_DATASET_LOCAL_NAME:-"wc-en-open-slime-4k"}
 OUT_NAME=${SLIME_SCRIPT_OUTPUT_NAME:-"wc_vlm_${MODEL_NAME}"}
 
 # GPU 数
 NUM_GPUS=${SLIME_SCRIPT_NUM_GPUS:-8}
+
+# dry run: 1 表示只打印最终命令，不真正提交训练
+DRY_RUN=${SLIME_SCRIPT_DRY_RUN:-0}
 
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${DATASET_ROOT}"
@@ -61,6 +68,7 @@ if [ "${SLIME_SCRIPT_LOG:-1}" = "1" ]; then
 fi
 
 echo "========== ENV CHECK =========="
+echo "HF_ENDPOINT=${HF_ENDPOINT}"
 conda env list || true
 micromamba env list || true
 pip list || true
@@ -91,7 +99,6 @@ if ! echo "$VALID_MODELS" | grep -qw "$MODEL_NAME"; then
    exit 1
 fi
 
-MODEL_NAME_LOWER=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
 MODEL_PATH="${MODEL_ROOT}/${MODEL_NAME}"
 
 # ==============================
@@ -99,7 +106,8 @@ MODEL_PATH="${MODEL_ROOT}/${MODEL_NAME}"
 # ==============================
 if [ ! -d "${MODEL_PATH}" ]; then
    echo "Local model not found: ${MODEL_PATH}"
-   echo "Downloading model from Hugging Face: ${MODEL_HF_REPO}"
+   echo "Downloading model from Hugging Face mirror: ${MODEL_HF_REPO}"
+   echo "Using HF_ENDPOINT=${HF_ENDPOINT}"
    mkdir -p "${MODEL_PATH}"
 
    if command -v hf >/dev/null 2>&1; then
@@ -125,7 +133,7 @@ echo "Model ready at ${MODEL_PATH}"
 TRAIN_FILE="${DATASET_ROOT}/${DATASET_LOCAL_NAME}/train.parquet"
 
 if [ ! -f "${TRAIN_FILE}" ]; then
-   echo "Local parquet dataset not found. Preparing dataset from Hugging Face..."
+   echo "Local parquet dataset not found. Preparing dataset from Hugging Face mirror..."
    mkdir -p "${DATASET_ROOT}/${DATASET_LOCAL_NAME}"
 
    python3 "${PROJECT_ROOT}/scripts/prepare_wc_dataset.py" \
@@ -169,7 +177,10 @@ pkill -9 redis || true
 set -ex
 
 export PYTHONBUFFERED=16
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+
+# reward 按你朋友那种方式：把 reward 目录直接加入 PYTHONPATH
+# 这样可以写 --custom-rm-path wc_reward.reward_func
+export PYTHONPATH="${PROJECT_ROOT}/reward:${PROJECT_ROOT}:${PYTHONPATH}"
 
 # ==============================
 # Detect NVLink
@@ -204,7 +215,7 @@ ROLLOUT_ARGS=(
    --metadata-key metadata
    --apply-chat-template
    --rollout-shuffle
-   --custom-rm-path reward.wc_reward.reward_func
+   --custom-rm-path wc_reward.reward_func
    --num-rollout 125
    --rollout-batch-size 32
    --n-samples-per-prompt 8
@@ -296,24 +307,39 @@ fi
 # ==============================
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"${MEGATRON_ROOT}:${PROJECT_ROOT}\",
+    \"PYTHONPATH\": \"${MEGATRON_ROOT}:${PROJECT_ROOT}/reward:${PROJECT_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"HF_ENDPOINT\": \"${HF_ENDPOINT}\"
   }
 }"
 
-ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 "${PROJECT_ROOT}/train.py" \
-   --actor-num-nodes 1 \
-   --actor-num-gpus-per-node ${NUM_GPUS} \
-   --multimodal-keys "${MULTIMODAL_KEYS}" \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${BACKEND_ARGS[@]} \
+RAY_CMD=(
+   ray job submit
+   --address="http://127.0.0.1:8265"
+   --runtime-env-json="${RUNTIME_ENV_JSON}"
+   --
+   python3 "${PROJECT_ROOT}/train.py"
+   --actor-num-nodes 1
+   --actor-num-gpus-per-node ${NUM_GPUS}
+   --multimodal-keys "${MULTIMODAL_KEYS}"
+   ${MODEL_ARGS[@]}
+   ${CKPT_ARGS[@]}
+   ${ROLLOUT_ARGS[@]}
+   ${EVAL_ARGS[@]}
+   ${GRPO_ARGS[@]}
+   ${OPTIMIZER_ARGS[@]}
+   ${SGLANG_ARGS[@]}
+   ${BACKEND_ARGS[@]}
    ${MISC_ARGS[@]}
+)
+
+if [ "${DRY_RUN}" = "1" ]; then
+   echo "===== DRY RUN COMMAND ====="
+   printf '%q ' "${RAY_CMD[@]}"
+   echo
+   echo "===== DRY RUN END ====="
+   exit 0
+fi
+
+"${RAY_CMD[@]}"
