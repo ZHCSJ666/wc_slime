@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+outputs/
+data/
+models/
+
+*.pt
+*.pth
+*.ckpt
+
+.DS_Store
